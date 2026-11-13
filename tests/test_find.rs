@@ -1,0 +1,2433 @@
+// Copyright 2021 Chad Williamson <chad@dahc.us>
+//
+// Use of this source code is governed by an MIT-style license that can be
+// found in the LICENSE file or at https://opensource.org/licenses/MIT.
+
+// Integration tests for the find command using the uutests framework.
+
+use regex::Regex;
+use std::fs::{self, File};
+use std::io::ErrorKind;
+use std::io::{Read, Write};
+use std::path::Path;
+use std::time;
+use tempfile::Builder;
+use uutests::util::TestScenario;
+
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
+
+#[cfg(windows)]
+use std::os::windows::fs::{symlink_dir, symlink_file};
+
+use common::test_helpers::fix_up_slashes;
+
+mod common;
+
+/// How `find` names itself in errors.
+const PROGRAM: &str = "find";
+
+/// How uucore heads an expression report: argv[0]'s base name, which keeps the
+/// `.exe` on Windows.
+const REPORT_PROGRAM: &str = if cfg!(windows) { "find.exe" } else { "find" };
+
+/// Returns a UCommand for `find` with the working directory set to the
+/// repository root, so that tests using relative `test_data/` paths work.
+fn ucmd() -> uutests::util::UCommand {
+    let ts = TestScenario::new("find");
+    let mut cmd = ts.cmd(env!("CARGO_BIN_EXE_find"));
+    cmd.current_dir(env!("CARGO_MANIFEST_DIR"));
+    cmd
+}
+
+// Variants of fix_up_slashes that properly escape the forward slashes for
+// use in a regex.
+#[cfg(windows)]
+fn fix_up_regex_slashes(re: &str) -> String {
+    re.replace('/', "\\\\")
+}
+
+#[cfg(not(windows))]
+fn fix_up_regex_slashes(re: &str) -> String {
+    re.to_owned()
+}
+
+#[test]
+fn no_args() {
+    ucmd().succeeds().no_stderr().stdout_contains("test_data");
+}
+
+#[test]
+fn find_version() {
+    // Regression test: `find --version` used to print "find (Rust) X.Y.Z",
+    // deviating from the format used by the other utilities. It must print
+    // "find X.Y.Z" to stdout and exit successfully.
+    let output = ucmd().arg("--version").succeeds();
+    let result = output.no_stderr();
+
+    assert!(
+        result.stdout_str().starts_with("find "),
+        "expected stdout to start with 'find ', got: {:?}",
+        result.stdout_str()
+    );
+    assert!(
+        !result.stdout_str().contains("(Rust)"),
+        "version output should not contain '(Rust)': {:?}",
+        result.stdout_str()
+    );
+
+    let second_word = result.stdout_str().split_whitespace().nth(1).unwrap_or("");
+    assert!(
+        second_word
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_digit()),
+        "expected the second word to be the version number, got: {:?}",
+        result.stdout_str()
+    );
+}
+
+#[test]
+fn two_matchers_both_match() {
+    ucmd()
+        .args(&["-type", "d", "-name", "test_data"])
+        .succeeds()
+        .no_stderr()
+        .stdout_contains("test_data");
+}
+
+#[test]
+fn two_matchers_one_matches() {
+    ucmd()
+        .args(&["-type", "f", "-name", "test_data"])
+        .succeeds()
+        .no_output();
+}
+
+#[test]
+fn multiple_matcher_success() {
+    ucmd()
+        .args(&["-type", "f,d,l", "-name", "abbbc"])
+        .succeeds()
+        .no_stderr()
+        .stdout_contains("abbbc");
+
+    ucmd()
+        .args(&["-xtype", "f,d,l", "-name", "abbbc"])
+        .succeeds()
+        .no_stderr()
+        .stdout_contains("abbbc");
+}
+
+#[test]
+fn invalid_newerxy_predicate_is_rejected() {
+    // GNU find rejects over-long / invalid -newerXY tokens instead of matching a
+    // valid prefix (issue #782: -neweraBcmty was accepted as -neweraB).
+    ucmd()
+        .args(&["-neweraBcmty", "."])
+        .fails()
+        .stderr_contains("unknown predicate `-neweraBcmty'")
+        .no_stdout();
+
+    ucmd()
+        .args(&["-newermmEXTRA", "."])
+        .fails()
+        .stderr_contains("unknown predicate `-newermmEXTRA'")
+        .no_stdout();
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_argument_is_rejected_gracefully() {
+    // A non-UTF-8 argument must produce a clean error, not a panic (#816).
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    ucmd()
+        .arg(OsString::from_vec(vec![b'-', b'p', 0xff]))
+        .fails()
+        .stderr_contains("non-UTF-8")
+        .no_stdout();
+}
+
+#[test]
+fn size_rejects_non_numeric_prefix() {
+    // A non-numeric prefix or an invalid double sign is rejected, matching GNU.
+    for bad in ["x5c", "abc5c", "+-5c", "--5c", "+++5c"] {
+        ucmd()
+            .args(&["./test_data", "-size", bad])
+            .fails()
+            .stderr_contains("argument to -size")
+            .no_stdout();
+    }
+    for good in ["5c", "+5c", "-5c", "++5c", "-+5c"] {
+        ucmd().args(&["./test_data", "-size", good]).succeeds();
+    }
+}
+
+#[test]
+fn depth_rejects_signed_value() {
+    // A signed depth like "+1" is rejected, matching GNU find.
+    for opt in ["-maxdepth", "-mindepth"] {
+        ucmd()
+            .args(&["./test_data", opt, "+1"])
+            .fails()
+            .stderr_contains("positive decimal integer argument");
+        ucmd().args(&["./test_data", opt, "1"]).succeeds();
+    }
+}
+
+#[test]
+fn mindepth_exceeds_maxdepth_outputs_nothing() {
+    // When -mindepth is greater than -maxdepth no entry can match, so find
+    // prints nothing and exits successfully, matching GNU find.
+    ucmd()
+        .args(&["./test_data/simple", "-mindepth", "2", "-maxdepth", "1"])
+        .succeeds()
+        .no_stdout();
+}
+
+#[test]
+fn expression_diagnostics_stay_out_of_the_way_of_scripts() {
+    // A test harness captures stderr, so it is never a terminal and the error
+    // must stay the single GNU-compatible line -- which is what the GNU and
+    // bfs compatibility suites assert on. `never` holds even at a terminal;
+    // any value other than `always` reads as unset rather than as "on".
+    for value in [None, Some(""), Some("never"), Some("NEVER"), Some("1")] {
+        let mut command = ucmd();
+        command.args(&["-true", "-o", "-nmae", "x"]);
+        if let Some(value) = value {
+            command.env("UUTILS_DIAG", value);
+        }
+        let output = command.fails().no_stdout().stderr_str().to_owned();
+        assert_eq!(
+            output.trim_end(),
+            format!("{PROGRAM}: unknown predicate `-nmae'")
+        );
+    }
+}
+
+#[test]
+fn expression_diagnostics_underline_the_bad_argument() {
+    // Asking for a report has to produce one, including at a redirected
+    // stderr like this test's.
+    for value in ["always", "ALWAYS"] {
+        let output = ucmd()
+            .args(&["-true", "-o", "-nmae", "x"])
+            .env("UUTILS_DIAG", value)
+            .fails()
+            .no_stdout()
+            .stderr_str()
+            .to_owned();
+
+        // The plain message still leads, so nothing that matched before stops
+        // matching.
+        assert!(output.starts_with(&format!("{REPORT_PROGRAM}: unknown predicate `-nmae'\n")));
+        assert!(output.contains("-true -o -nmae x"));
+        assert!(output.contains("not a known predicate"));
+        assert!(output.contains("did you mean `-name'?"));
+        // Piped output must not be coloured.
+        assert!(!output.contains('\u{1b}'));
+    }
+}
+
+#[test]
+fn expression_diagnostics_do_not_guess_at_two_letter_arguments() {
+    // `-H` is a real option, valid only before the paths; put it after them and
+    // it reaches the expression parser. Every two-character predicate is one
+    // edit away from it, so any suggestion here would be arbitrary.
+    let output = ucmd()
+        .args(&[".", "-H"])
+        .env("UUTILS_DIAG", "always")
+        .fails()
+        .no_stdout()
+        .stderr_str()
+        .to_owned();
+
+    assert!(output.starts_with(&format!("{REPORT_PROGRAM}: unknown predicate `-H'\n")));
+    assert!(!output.contains("did you mean"));
+}
+
+#[test]
+fn multiple_matcher_failure() {
+    ucmd()
+        .args(&["-type", "fd", "-name", "abbb"])
+        .fails()
+        .stderr_contains("Must separate multiple arguments")
+        .no_stdout();
+
+    ucmd()
+        .args(&["-type", "f,", "-name", "abbb"])
+        .fails()
+        .stderr_contains("list is ending on: ','")
+        // GNU prints a single "find: " prefix; the message must not double it.
+        .stderr_does_not_contain("find: find:")
+        .no_stdout();
+
+    ucmd()
+        .args(&["-type", "f,f", "-name", "abbb"])
+        .fails()
+        .stderr_contains("Duplicate file type")
+        .no_stdout();
+
+    ucmd()
+        .args(&["-type", "", "-name", "abbb"])
+        .fails()
+        .stderr_contains("should contain at least one letter")
+        .no_stdout();
+
+    ucmd()
+        .args(&["-type", "x,y", "-name", "abbb"])
+        .fails()
+        .stderr_contains("Unrecognised type argument")
+        .no_stdout();
+
+    // x-type tests below
+    ucmd()
+        .args(&["-xtype", "fd", "-name", "abbb"])
+        .fails()
+        .stderr_contains("Must separate multiple arguments")
+        .no_stdout();
+
+    ucmd()
+        .args(&["-xtype", "f,", "-name", "abbb"])
+        .fails()
+        .stderr_contains("list is ending on: ','")
+        .stderr_does_not_contain("find: find:")
+        .no_stdout();
+
+    ucmd()
+        .args(&["-xtype", "f,f", "-name", "abbb"])
+        .fails()
+        .stderr_contains("Duplicate file type")
+        .no_stdout();
+
+    ucmd()
+        .args(&["-xtype", "", "-name", "abbb"])
+        .fails()
+        .stderr_contains("should contain at least one letter")
+        .no_stdout();
+
+    ucmd()
+        .args(&["-xtype", "x,y", "-name", "abbb"])
+        .fails()
+        .stderr_contains("Unrecognised type argument")
+        .no_stdout();
+}
+
+#[test]
+fn files0_empty_file() {
+    ucmd()
+        .args(&["-files0-from", "./test_data/simple/abbbc"])
+        .succeeds()
+        .no_output();
+}
+
+#[test]
+fn files0_file_basic_success() {
+    ucmd()
+        .args(&["-files0-from", "./test_data/simple/abbbc"])
+        .succeeds()
+        .no_output();
+
+    #[cfg(unix)]
+    {
+        let temp_dir = Builder::new().prefix("find_cmd_").tempdir().unwrap();
+        let test_file = temp_dir.path().join("test_files0");
+        let mut file = File::create(&test_file).expect("created test file");
+        file.write_all(b"./test_data/\0./test_data/simple/\0")
+            .expect("file write error");
+
+        ucmd()
+            .args(&["-files0-from", &test_file.display().to_string()])
+            .succeeds()
+            .no_stderr()
+            .stdout_contains("/test_data/");
+    }
+}
+
+#[test]
+fn files0_invalid_utf8_fails() {
+    let temp_dir = Builder::new().prefix("find_files0_").tempdir().unwrap();
+    let path_list = temp_dir.path().join("paths0");
+    fs::write(&path_list, b"\xff\nfile2.txt\n").expect("wrote path list");
+
+    ucmd()
+        .arg("-files0-from")
+        .arg(path_list)
+        .fails()
+        .stderr_contains("invalid utf-8 sequence")
+        .no_stdout();
+}
+
+#[test]
+fn files0_empty_pipe() {
+    ucmd()
+        .args(&["-files0-from", "-"])
+        .pipe_in(b"" as &[u8])
+        .succeeds()
+        .no_output();
+}
+
+#[test]
+fn files0_pipe_basic() {
+    ucmd()
+        .pipe_in(b"./test_data/simple\0./test_data/links" as &[u8])
+        .args(&["-files0-from", "-"])
+        .succeeds()
+        .no_stderr()
+        .stdout_contains("./test_data/");
+}
+
+#[test]
+fn files0_pipe_double_nul() {
+    ucmd()
+        .pipe_in(b"./test_data/simple\0\0./test_data/links" as &[u8])
+        .args(&["-files0-from", "-"])
+        .succeeds()
+        .stderr_contains("invalid zero-length file name")
+        .stdout_contains("./test_data/");
+}
+
+/// The starting points are read incrementally, so output for the earlier ones
+/// appears even though a later one is invalid UTF-8 (see issue #779: the input
+/// used to be slurped into memory in its entirety before anything was walked).
+#[test]
+fn files0_streams_before_invalid_utf8() {
+    ucmd()
+        .pipe_in(b"./test_data/simple\0\xff\0" as &[u8])
+        .args(&["-files0-from", "-"])
+        .fails()
+        .stdout_contains("./test_data/simple")
+        .stderr_contains("invalid utf-8 sequence");
+}
+
+/// A starting point given on the command line can't be mixed with
+/// -files0-from, even when it is `.`, the same path find uses by default.
+#[test]
+fn files0_with_file_operand_is_rejected() {
+    for operand in [".", "./test_data"] {
+        ucmd()
+            .args(&[operand, "-files0-from", "./test_data/simple/abbbc"])
+            .fails()
+            .code_is(1)
+            .no_stdout()
+            .stderr_is(format!(
+                "find: extra operand '{operand}'\n\
+                 find: file operands cannot be combined with -files0-from\n"
+            ));
+    }
+}
+
+/// Both the starting points and the answers to the prompts would be read from
+/// stdin, so GNU find rejects the combination up front (bfs `gnu/*_ok` tests).
+#[test]
+fn files0_stdin_with_ok_is_rejected() {
+    // No pipe_in(): find must reject the combination before reading anything,
+    // so feeding it input would just race the exit and break the pipe.
+    for action in ["-ok", "-okdir"] {
+        ucmd()
+            .args(&["-files0-from", "-", action, "echo", "{}", ";"])
+            .fails()
+            .no_stdout()
+            .stderr_contains(
+                "option -files0-from reading from standard input cannot be combined \
+                 with -ok, -okdir",
+            );
+    }
+}
+
+/// Reading the starting points from a file leaves stdin free for the prompts,
+/// so the combination is allowed.
+#[test]
+fn files0_file_with_ok_is_allowed() {
+    let temp_dir = Builder::new().prefix("find_files0_ok_").tempdir().unwrap();
+    let starting_points = temp_dir.path().join("starting_points");
+    fs::write(&starting_points, b"./test_data/simple\0").unwrap();
+
+    ucmd()
+        .args(&[
+            "-files0-from",
+            &starting_points.display().to_string(),
+            "-ok",
+            "echo",
+            "{}",
+            ";",
+        ])
+        // Declined, so nothing is run and every entry is consumed.
+        .pipe_in(b"n\n" as &[u8])
+        .succeeds()
+        .no_stdout()
+        .stderr_contains("< echo ... ./test_data/simple > ?");
+}
+
+/// -execdir/-okdir chdir into the directory being scanned, so a relative $PATH
+/// entry would resolve there; GNU find refuses to run at all.
+#[cfg(unix)]
+#[test]
+fn execdir_rejects_relative_path_entries() {
+    for action in ["-execdir", "-okdir"] {
+        ucmd()
+            .env("PATH", "/nonexistent-bin:")
+            .args(&["./test_data/simple", action, "echo", "{}", ";"])
+            .fails()
+            .no_stdout()
+            .stderr_contains("The current directory is included in the PATH");
+
+        ucmd()
+            .env("PATH", "tools/bin:/nonexistent-bin")
+            .args(&["./test_data/simple", action, "echo", "{}", ";"])
+            .fails()
+            .no_stdout()
+            .stderr_contains("The relative path 'tools/bin' is included in the PATH");
+    }
+}
+
+/// An absolute $PATH is fine, and -exec/-ok (which do not chdir) never care.
+#[cfg(unix)]
+#[test]
+fn exec_accepts_relative_path_entries() {
+    // /bin on Linux, /usr/bin on macOS: keep both so `true` resolves either way.
+    ucmd()
+        .env("PATH", "tools/bin:/bin:/usr/bin")
+        .args(&["./test_data/simple", "-exec", "true", "{}", ";"])
+        .succeeds()
+        .no_output();
+}
+
+#[test]
+fn files0_no_file() {
+    #[cfg(unix)]
+    {
+        ucmd()
+            .args(&["-files0-from", "xyz.nonexistentFile"])
+            .fails()
+            .stderr_contains("No such file or directory")
+            .no_stdout();
+    }
+    #[cfg(windows)]
+    {
+        ucmd()
+            .args(&["-files0-from", "xyz.nonexistantFile"])
+            .fails()
+            .stderr_contains("The system cannot find the file specified.")
+            .no_stdout();
+    }
+}
+
+#[test]
+fn files0_basic() {
+    ucmd()
+        .arg("-files0-from")
+        .fails()
+        .stderr_contains("missing argument to `-files0-from'")
+        .no_stdout();
+}
+
+#[test]
+fn matcher_with_side_effects_at_end() {
+    let temp_dir = Builder::new().prefix("find_cmd_").tempdir().unwrap();
+
+    let temp_dir_path = temp_dir.path().to_str().unwrap();
+    let test_file = temp_dir.path().join("test");
+    File::create(&test_file).expect("created test file");
+
+    ucmd()
+        .args(&[temp_dir_path, "-name", "test", "-delete"])
+        .succeeds()
+        .no_output();
+
+    assert!(!test_file.exists(), "test file should be deleted");
+    assert!(temp_dir.path().exists(), "temp dir should NOT be deleted");
+}
+
+#[test]
+fn matcher_with_side_effects_in_front() {
+    let temp_dir = Builder::new().prefix("find_cmd_").tempdir().unwrap();
+
+    let temp_dir_path = temp_dir.path().to_str().unwrap();
+    let test_file = temp_dir.path().join("test");
+    File::create(&test_file).expect("created test file");
+
+    ucmd()
+        .args(&[temp_dir_path, "-delete", "-name", "test"])
+        .succeeds()
+        .no_output();
+
+    assert!(!test_file.exists(), "test file should be deleted");
+    assert!(!temp_dir.path().exists(), "temp dir should also be deleted");
+}
+
+// This could be covered by a unit test in principle... in practice, changing
+// the working dir can't be done safely in unit tests unless `--test-threads=1`
+// or `serial` goes everywhere, and it doesn't seem possible to get an
+// appropriate `walkdir::DirEntry` for "." without actually changing dirs
+// (or risking deletion of the repo itself).
+#[test]
+fn delete_on_dot_dir() {
+    let temp_dir = Builder::new().prefix("example").tempdir().unwrap();
+
+    // "." should be matched (confirmed by the print), but not deleted.
+    ucmd()
+        .current_dir(temp_dir.path())
+        .args(&[".", "-delete", "-print"])
+        .succeeds()
+        .no_stderr()
+        .stdout_only(".\n");
+
+    assert!(temp_dir.path().exists(), "temp dir should still exist");
+}
+
+#[test]
+fn regex_types() {
+    let temp_dir = Builder::new().prefix("find_cmd_").tempdir().unwrap();
+
+    let temp_dir_path = temp_dir.path().to_str().unwrap();
+    let test_file = temp_dir.path().join("teeest");
+    File::create(test_file).expect("created test file");
+
+    ucmd()
+        .arg(temp_dir_path)
+        .arg("-regex")
+        .arg(fix_up_regex_slashes(".*/tE+st"))
+        .succeeds()
+        .no_output();
+
+    ucmd()
+        .arg(temp_dir_path)
+        .arg("-iregex")
+        .arg(fix_up_regex_slashes(".*/tE+st"))
+        .succeeds()
+        .no_stderr()
+        .stdout_contains("teeest");
+
+    ucmd()
+        .arg(temp_dir_path)
+        .args(&["-regextype", "posix-basic", "-regex"])
+        .arg(fix_up_regex_slashes(r".*/te\{1,3\}st"))
+        .succeeds()
+        .no_stderr()
+        .stdout_contains("teeest");
+
+    ucmd()
+        .arg(temp_dir_path)
+        .args(&["-regextype", "posix-extended", "-regex"])
+        .arg(fix_up_regex_slashes(".*/te{1,3}st"))
+        .succeeds()
+        .no_stderr()
+        .stdout_contains("teeest");
+
+    ucmd()
+        .arg(temp_dir_path)
+        .args(&["-regextype", "ed", "-regex"])
+        .arg(fix_up_regex_slashes(r".*/te\{1,3\}st"))
+        .succeeds()
+        .no_stderr()
+        .stdout_contains("teeest");
+
+    ucmd()
+        .arg(temp_dir_path)
+        .args(&["-regextype", "sed", "-regex"])
+        .arg(fix_up_regex_slashes(r".*/te\{1,3\}st"))
+        .succeeds()
+        .no_stderr()
+        .stdout_contains("teeest");
+}
+
+#[rstest::rstest]
+#[case::inherited(
+    &["-regextype", "posix-basic", "("],
+    &[")"],
+    "f1+"
+)]
+#[case::inherited_nested(
+    &["-regextype", "posix-basic", "(", "("],
+    &[")", ")"],
+    "f1+"
+)]
+#[case::propagated(
+    &["(", "-regextype", "posix-basic", ")"],
+    &[],
+    "f1+"
+)]
+#[case::propagated_nested(
+    &["(", "(", "-regextype", "posix-basic", ")", ")"],
+    &[],
+    "f1+"
+)]
+#[case::overridden(
+    &["-regextype", "posix-basic", "(", "-regextype", "posix-extended", ")"],
+    &[],
+    "f1"
+)]
+#[case::positional(
+    &[
+        "-regextype", "posix-extended", "-regex", ".*f[0-9]+",
+        "(", "-regextype", "posix-basic", ")", "!"
+    ],
+    &[],
+    "f1"
+)]
+#[case::short_circuited(
+    &["(", "-false", "-a", "-regextype", "posix-basic", ")", "-o", "("],
+    &[")"],
+    "f1+"
+)]
+fn regex_type_parentheses(
+    #[values("-regex", "-iregex")] predicate: &str,
+    #[case] before: &[&str],
+    #[case] after: &[&str],
+    #[case] expected: &str,
+) {
+    let temp_dir = Builder::new().prefix("find_regex_").tempdir().unwrap();
+    fs::create_dir(temp_dir.path().join("d")).unwrap();
+    File::create(temp_dir.path().join("d/f1")).unwrap();
+    File::create(temp_dir.path().join("d/f1+")).unwrap();
+
+    // Basic syntax matches the literal '+', while extended syntax matches f1.
+    let pattern = if predicate == "-iregex" {
+        ".*/F[0-9]+"
+    } else {
+        ".*/f[0-9]+"
+    };
+    ucmd()
+        .current_dir(temp_dir.path())
+        .env("LC_ALL", "C")
+        .arg("d")
+        .args(before)
+        .arg(predicate)
+        .arg(fix_up_regex_slashes(pattern))
+        .args(after)
+        .arg("-print")
+        .succeeds()
+        .no_stderr()
+        .stdout_only(fix_up_slashes(&format!("d/{expected}\n")));
+}
+
+#[test]
+fn empty_files() {
+    let temp_dir = Builder::new().prefix("find_cmd_").tempdir().unwrap();
+    let temp_dir_path = temp_dir.path().to_str().unwrap();
+
+    ucmd()
+        .args(&[temp_dir_path, "-empty"])
+        .succeeds()
+        .no_stderr()
+        .stdout_only(fix_up_slashes(&format!("{temp_dir_path}\n")));
+
+    let test_file_path = temp_dir.path().join("test");
+    let mut test_file = File::create(&test_file_path).unwrap();
+
+    ucmd()
+        .args(&[temp_dir_path, "-empty"])
+        .succeeds()
+        .no_stderr()
+        .stdout_only(fix_up_slashes(&format!(
+            "{}\n",
+            test_file_path.to_string_lossy()
+        )));
+
+    let subdir_path = temp_dir.path().join("subdir");
+    std::fs::create_dir(&subdir_path).unwrap();
+
+    ucmd()
+        .args(&[temp_dir_path, "-empty", "-sorted"])
+        .succeeds()
+        .no_stderr()
+        .stdout_only(fix_up_slashes(&format!(
+            "{}\n{}\n",
+            subdir_path.to_string_lossy(),
+            test_file_path.to_string_lossy()
+        )));
+
+    write!(test_file, "x").unwrap();
+    test_file.sync_all().unwrap();
+
+    ucmd()
+        .args(&[temp_dir_path, "-empty", "-sorted"])
+        .succeeds()
+        .no_stderr()
+        .stdout_only(fix_up_slashes(&format!(
+            "{}\n",
+            subdir_path.to_string_lossy(),
+        )));
+}
+
+#[test]
+fn find_printf() {
+    #[cfg(unix)]
+    {
+        if let Err(e) = symlink("abbbc", "test_data/links/link-f") {
+            assert!(
+                e.kind() == ErrorKind::AlreadyExists,
+                "Failed to create sym link: {e:?}"
+            );
+        }
+        if let Err(e) = symlink("subdir", "test_data/links/link-d") {
+            assert!(
+                e.kind() == ErrorKind::AlreadyExists,
+                "Failed to create sym link: {e:?}"
+            );
+        }
+        if let Err(e) = symlink("missing", "test_data/links/link-missing") {
+            assert!(
+                e.kind() == ErrorKind::AlreadyExists,
+                "Failed to create sym link: {e:?}"
+            );
+        }
+        if let Err(e) = symlink("abbbc/x", "test_data/links/link-notdir") {
+            assert!(
+                e.kind() == ErrorKind::AlreadyExists,
+                "Failed to create sym link: {e:?}"
+            );
+        }
+        if let Err(e) = symlink("link-loop", "test_data/links/link-loop") {
+            assert!(
+                e.kind() == ErrorKind::AlreadyExists,
+                "Failed to create sym link: {e:?}"
+            );
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Err(e) = symlink_file("abbbc", "test_data/links/link-f") {
+            assert!(
+                e.kind() == ErrorKind::AlreadyExists,
+                "Failed to create sym link: {:?}",
+                e
+            );
+        }
+        if let Err(e) = symlink_dir("subdir", "test_data/links/link-d") {
+            assert!(
+                e.kind() == ErrorKind::AlreadyExists,
+                "Failed to create sym link: {:?}",
+                e
+            );
+        }
+        if let Err(e) = symlink_file("missing", "test_data/links/link-missing") {
+            assert!(
+                e.kind() == ErrorKind::AlreadyExists,
+                "Failed to create sym link: {:?}",
+                e
+            );
+        }
+        if let Err(e) = symlink_file("abbbc/x", "test_data/links/link-notdir") {
+            assert!(
+                e.kind() == ErrorKind::AlreadyExists,
+                "Failed to create sym link: {:?}",
+                e
+            );
+        }
+    }
+
+    ucmd()
+        .arg(fix_up_slashes("./test_data/simple"))
+        .args(&["-sorted", "-printf", "%f %d %h %H %p %P %y\n"])
+        .succeeds()
+        .no_stderr()
+        .stdout_only(fix_up_slashes(
+            "simple 0 ./test_data ./test_data/simple \
+            ./test_data/simple  d\n\
+            abbbc 1 ./test_data/simple ./test_data/simple \
+            ./test_data/simple/abbbc abbbc f\n\
+            subdir 1 ./test_data/simple ./test_data/simple \
+            ./test_data/simple/subdir subdir d\n\
+            ABBBC 2 ./test_data/simple/subdir ./test_data/simple \
+            ./test_data/simple/subdir/ABBBC subdir/ABBBC f\n",
+        ));
+
+    fs::create_dir_all("a").expect("Failed to create directory 'a'");
+    let result = ucmd().args(&["a", "-printf", "%A+"]).succeeds();
+
+    let output_str = result.stdout_str();
+    let re = Regex::new(r"^\d{4}-\d{2}-\d{2}\+\d{2}:\d{2}:\d{2}\.\d{9}0$")
+        .expect("Failed to compile regex");
+    assert!(
+        re.is_match(output_str.trim()),
+        "Output did not match expected timestamp format"
+    );
+
+    ucmd()
+        .arg(fix_up_slashes("./test_data/links"))
+        .args(&["-sorted", "-type", "l", "-printf", "%f %l %y %Y\n"])
+        .succeeds()
+        .no_stderr()
+        .stdout_only(
+            [
+                "link-d subdir l d\n",
+                "link-f abbbc l f\n",
+                #[cfg(unix)]
+                "link-loop link-loop l L\n",
+                "link-missing missing l N\n",
+                // We can't detect ENOTDIR on non-unix platforms yet.
+                #[cfg(not(unix))]
+                "link-notdir abbbc/x l ?\n",
+                #[cfg(unix)]
+                "link-notdir abbbc/x l N\n",
+            ]
+            .join(""),
+        );
+}
+
+#[test]
+fn find_printf_backslash_c_runs_the_next_action() {
+    ucmd()
+        .arg(fix_up_slashes("./test_data/simple"))
+        .args(&["-sorted", "-printf", "%f\\c%s\\n", "-printf", "|\\n"])
+        .succeeds()
+        .no_stderr()
+        .stdout_only("simple|\nabbbc|\nsubdir|\nABBBC|\n");
+}
+
+#[test]
+#[cfg(unix)]
+fn find_printf_output_comes_before_exec_output() {
+    ucmd()
+        .args(&["./test_data/simple", "-maxdepth", "0"])
+        .args(&["-printf", "P:%p ", "-exec", "echo", "E:{}", ";"])
+        .succeeds()
+        .no_stderr()
+        .stdout_only("P:./test_data/simple E:./test_data/simple\n");
+}
+
+#[test]
+#[cfg(unix)] // %T+ prints local time; TZ only reliably selects it on unix
+fn find_printf_time_plus_fixed_width_fraction() {
+    let temp_dir = Builder::new().prefix("find_time_plus_").tempdir().unwrap();
+    let file_path = temp_dir.path().join("stamped");
+    File::create(&file_path).expect("create test file");
+
+    // The fraction must always be a dot followed by ten digits, even when
+    // the timestamp falls on a whole second.
+    for (nanos, expected) in [
+        (0, "2013-06-20+11:22:33.0000000000\n"),
+        (250_000_000, "2013-06-20+11:22:33.2500000000\n"),
+    ] {
+        filetime::set_file_mtime(
+            &file_path,
+            filetime::FileTime::from_unix_time(1_371_727_353, nanos),
+        )
+        .expect("set test file mtime");
+
+        ucmd()
+            .env("TZ", "UTC0")
+            .arg(&file_path)
+            .args(&["-printf", "%T+\n"])
+            .succeeds()
+            .stdout_only(expected);
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn find_printf_epoch_times_before_1970() {
+    let temp_dir = Builder::new().prefix("find_epoch_").tempdir().unwrap();
+    let file_path = temp_dir.path().join("stamped");
+    let output_path = temp_dir.path().join("output");
+    File::create(&file_path).expect("create test file");
+
+    for (seconds, nanos, expected_time) in [
+        (-1, 0, "-1.0000000000"),
+        (-1, 500_000_000, "-1.5000000000"),
+        (0, 0, "0.0000000000"),
+        (1, 500_000_000, "1.5000000000"),
+    ] {
+        let timestamp = filetime::FileTime::from_unix_time(seconds, nanos);
+        filetime::set_file_times(&file_path, timestamp, timestamp).expect("set test file times");
+        let format = "before:%A@|%T@:after\n";
+        let expected = format!("before:{expected_time}|{expected_time}:after\n");
+
+        ucmd()
+            .env("LC_ALL", "C")
+            .arg(&file_path)
+            .args(&["-printf", format])
+            .succeeds()
+            .no_stderr()
+            .stdout_only(&expected);
+
+        ucmd()
+            .env("LC_ALL", "C")
+            .arg(&file_path)
+            .arg("-fprintf")
+            .arg(&output_path)
+            .arg(format)
+            .succeeds()
+            .no_output();
+        assert_eq!(fs::read(&output_path).unwrap(), expected.as_bytes());
+    }
+}
+
+#[test]
+#[cfg(unix)] // TZ only reliably selects the local time zone on unix
+fn find_newermt_uses_local_time() {
+    let temp_dir = Builder::new().prefix("find_newermt_").tempdir().unwrap();
+    // 1999-12-31 23:00 and 2000-01-01 04:00 UTC
+    for (name, secs) in [("early", 946_681_200), ("late", 946_699_200)] {
+        let file_path = temp_dir.path().join(name);
+        File::create(&file_path).expect("create test file");
+        filetime::set_file_mtime(&file_path, filetime::FileTime::from_unix_time(secs, 0))
+            .expect("set test file mtime");
+    }
+
+    // 03:00 is 03:00 UTC in UTC0 and 22:00 UTC the day before in UTC-5.
+    for (tz, expected) in [("UTC0", "late\n"), ("UTC-5", "early\nlate\n")] {
+        let result = ucmd()
+            .env("TZ", tz)
+            .arg(temp_dir.path())
+            .args(&[
+                "-type",
+                "f",
+                "-newermt",
+                "2000-01-01 03:00:00",
+                "-printf",
+                "%f\n",
+            ])
+            .succeeds();
+        let mut names: Vec<_> = result.stdout_str().lines().collect();
+        names.sort_unstable();
+        assert_eq!(names.join("\n") + "\n", expected, "TZ={tz}");
+    }
+}
+
+#[test]
+fn find_printf_octal_escapes_write_raw_bytes() {
+    use std::fmt::Write as _;
+
+    let mut format = String::from("é");
+    for value in 0..=0o777 {
+        write!(format, "\\{value:03o}").unwrap();
+    }
+    format.push_str("€%f\\n");
+    let bytes = (0..=u8::MAX).chain(0..=u8::MAX).collect::<Vec<_>>();
+    let expected = ["é".as_bytes(), &bytes, "€simple\n".as_bytes()].concat();
+
+    ucmd()
+        .args(&["test_data/simple", "-maxdepth", "0", "-printf", &format])
+        .succeeds()
+        .no_stderr()
+        .stdout_is_bytes(&expected);
+
+    let temp_dir = Builder::new()
+        .prefix("find_fprintf_octal_")
+        .tempdir()
+        .unwrap();
+    let output = temp_dir.path().join("out");
+    ucmd()
+        .args(&["test_data/simple", "-maxdepth", "0", "-fprintf"])
+        .arg(&output)
+        .arg(&format)
+        .succeeds()
+        .no_stderr()
+        .stdout_is_bytes(b"");
+    assert_eq!(fs::read(output).unwrap(), expected);
+}
+
+#[test]
+fn find_printf_octal_escape_before_multibyte_char() {
+    ucmd()
+        .args(&["./test_data/simple", "-maxdepth", "0", "-printf", "\\0€\\n"])
+        .succeeds()
+        .no_stderr()
+        .stdout_only("\0€\n");
+}
+
+#[test]
+fn find_printf_unrecognized_directive_prints_literally() {
+    ucmd()
+        .args(&["./test_data/simple", "-maxdepth", "0", "-printf", "%€|\n"])
+        .succeeds()
+        .stdout_contains("%€|\n")
+        .stderr_contains("unrecognized format directive '%€'");
+}
+
+#[test]
+fn find_printf_unrecognized_escape_prints_literally() {
+    ucmd()
+        .args(&["./test_data/simple", "-maxdepth", "0", "-printf", "\\€|\n"])
+        .succeeds()
+        .stdout_contains("\\€|\n")
+        .stderr_contains("unrecognized escape '\\€'");
+}
+
+#[test]
+fn find_printf_trailing_backslash() {
+    let expected_warning = b"find: warning: escape `\\' followed by nothing at all\n";
+    ucmd()
+        .args(&["test_data/simple", "-maxdepth", "0", "-printf", "x\\"])
+        .succeeds()
+        .stdout_is_bytes(b"x\\")
+        .stderr_is_bytes(expected_warning);
+
+    let temp_dir = Builder::new()
+        .prefix("find_fprintf_backslash_")
+        .tempdir()
+        .unwrap();
+    let file = temp_dir.path().join("out");
+    ucmd()
+        .args(&[
+            "test_data/simple",
+            "-maxdepth",
+            "0",
+            "-fprintf",
+            file.to_str().unwrap(),
+            "x\\",
+        ])
+        .succeeds()
+        .stdout_is_bytes(b"")
+        .stderr_is_bytes(expected_warning);
+    assert_eq!(fs::read(file).unwrap(), b"x\\");
+}
+
+#[test]
+fn find_printf_width_too_large() {
+    ucmd()
+        .args(&[
+            "./test_data/simple",
+            "-maxdepth",
+            "0",
+            "-printf",
+            "%70000s\\n",
+        ])
+        .fails()
+        .stderr_contains(format!("{PROGRAM}: Format width too large"));
+    ucmd()
+        .args(&[
+            "./test_data/simple",
+            "-maxdepth",
+            "0",
+            "-printf",
+            "%99999999999999999999s\\n",
+        ])
+        .fails()
+        .stderr_contains(format!("{PROGRAM}: Invalid format width"));
+}
+
+#[test]
+fn find_printf_precision_too_large() {
+    // GNU find prints nothing for a precision above INT_MAX, goes on, and
+    // fails with EOVERFLOW instead of trying to pad that far.
+    ucmd()
+        .args(&[
+            "./test_data/simple",
+            "-maxdepth",
+            "0",
+            "-printf",
+            "%.2147483648d%.99999999999999999999m|%.2147483647f|\\n",
+        ])
+        .fails_with_code(1)
+        .stdout_is("|simple|\n")
+        .stderr_contains("'standard output': Value too large for defined data type");
+}
+
+#[test]
+fn find_printf_multibyte_char_after_directive() {
+    ucmd()
+        .args(&["./test_data/simple", "-maxdepth", "0", "-printf", "%€\\n"])
+        .succeeds()
+        .stderr_contains("find: warning: unrecognized format directive '%€'")
+        .stdout_is("%€\n");
+    ucmd()
+        .args(&["./test_data/simple", "-maxdepth", "0", "-printf", "\\€\\n"])
+        .succeeds()
+        .stderr_contains("find: warning: unrecognized escape '\\€'")
+        .stdout_is("\\€\n");
+    ucmd()
+        .args(&["./test_data/simple", "-maxdepth", "0", "-printf", "%A€"])
+        .fails()
+        .stderr_contains(format!("{PROGRAM}: Invalid time specifier"));
+}
+
+#[cfg(unix)]
+#[test]
+fn find_perm() {
+    ucmd().args(&["-perm", "+rwx"]).succeeds();
+    ucmd().args(&["-perm", "u+rwX"]).succeeds();
+    ucmd().args(&["-perm", "u=g"]).succeeds();
+}
+
+#[cfg(unix)]
+#[test]
+fn find_perm_directory_symbolic_modes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp_dir = Builder::new().prefix("find_perm_").tempdir().unwrap();
+    for (name, mode, is_dir) in [
+        ("d600", 0o600, true),
+        ("d700", 0o700, true),
+        ("f600", 0o600, false),
+        ("f700", 0o700, false),
+    ] {
+        let path = temp_dir.path().join(name);
+        if is_dir {
+            fs::create_dir(&path).unwrap();
+        } else {
+            File::create(&path).unwrap();
+        }
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    for (pattern, expected) in [
+        ("u=rwX", "d700\nf600\n"),
+        ("-u+X", "d700\nf600\nf700\n"),
+        ("/u+X", "d700\nf600\nf700\n"),
+        ("u=rw", "d600\nf600\n"),
+        ("700", "d700\nf700\n"),
+    ] {
+        ucmd()
+            .current_dir(temp_dir.path())
+            .args(&[
+                "d600",
+                "d700",
+                "f600",
+                "f700",
+                "-maxdepth",
+                "0",
+                "-perm",
+                pattern,
+                "-print",
+            ])
+            .succeeds()
+            .no_stderr()
+            .stdout_is(expected);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn find_perm_plus_octal_is_rejected() {
+    // GNU find rejects the deprecated `-perm +MODE` octal form; only symbolic
+    // modes may follow a leading `+`.
+    ucmd()
+        .args(&["-perm", "+644"])
+        .fails()
+        .stderr_contains("invalid mode '+644'");
+    ucmd()
+        .args(&["-perm", "+0"])
+        .fails()
+        .stderr_contains("invalid mode '+0'");
+}
+
+#[cfg(unix)]
+#[test]
+fn find_inum() {
+    use std::os::unix::fs::MetadataExt;
+
+    let inum = fs::metadata("test_data/simple/abbbc")
+        .expect("metadata for abbbc")
+        .ino()
+        .to_string();
+
+    ucmd()
+        .args(&["test_data", "-inum", &inum])
+        .succeeds()
+        .no_stderr()
+        .stdout_contains("abbbc");
+}
+
+#[cfg(not(unix))]
+#[test]
+fn find_inum() {
+    ucmd()
+        .args(&["test_data", "-inum", "1"])
+        .fails()
+        .stderr_contains("not available on this platform")
+        .no_stdout();
+}
+
+/// Returns the first id from `start` for which `is_unmapped` holds.
+#[cfg(unix)]
+fn first_unmapped_id(start: u32, is_unmapped: impl Fn(u32) -> bool) -> u32 {
+    (start..u32::MAX)
+        .find(|&id| is_unmapped(id))
+        .expect("an unmapped id")
+}
+
+/// Variables that `fakeroot` sets alongside `LD_PRELOAD`. `UCommand` clears
+/// the environment and keeps only `LD_PRELOAD`, so without these `find` would
+/// not reach the fakeroot daemon and would see the real owners.
+#[cfg(unix)]
+const FAKEROOT_ENV: [&str; 3] = ["FAKEROOTKEY", "FAKED_MODE", "LD_LIBRARY_PATH"];
+
+/// Runs `find OPTION DIR TEST` and returns its output lines, sorted.
+#[cfg(unix)]
+fn sorted_find_output(option: &str, dir: &Path, test: &str) -> Vec<String> {
+    let mut cmd = ucmd();
+    for key in FAKEROOT_ENV {
+        if let Some(value) = std::env::var_os(key) {
+            cmd.env(key, value);
+        }
+    }
+    let result = cmd.arg(option).arg(dir).arg(test).succeeds();
+    let mut lines: Vec<String> = result.stdout_str().lines().map(String::from).collect();
+    lines.sort();
+    lines
+}
+
+#[cfg(unix)]
+#[test]
+fn find_nouser_nogroup_match_unowned_symlinks() {
+    use nix::unistd::{Gid, Group, Uid, User};
+    use std::os::unix::fs::lchown;
+
+    // Giving a file an owner without a passwd/group entry needs root, real or
+    // under `fakeroot` (as CI runs this test).
+    if !Uid::effective().is_root() {
+        return;
+    }
+
+    let unmapped_uid = first_unmapped_id(54321, |id| {
+        matches!(User::from_uid(Uid::from_raw(id)), Ok(None))
+    });
+    let unmapped_gid = first_unmapped_id(54321, |id| {
+        matches!(Group::from_gid(Gid::from_raw(id)), Ok(None))
+    });
+
+    let temp_dir = Builder::new().prefix("find_nouser_").tempdir().unwrap();
+    let dir = temp_dir.path();
+    // A link to a file with a known owner, and a dangling link, both unowned.
+    File::create(dir.join("owned")).unwrap();
+    symlink("owned", dir.join("orphan_link")).unwrap();
+    symlink("missing", dir.join("dangling")).unwrap();
+    for link in ["orphan_link", "dangling"] {
+        lchown(dir.join(link), Some(unmapped_uid), Some(unmapped_gid)).unwrap();
+    }
+
+    let path_of = |name: &str| dir.join(name).to_string_lossy().into_owned();
+    let both_links = vec![path_of("dangling"), path_of("orphan_link")];
+    let dangling_only = vec![path_of("dangling")];
+
+    for test in ["-nouser", "-nogroup"] {
+        // Without following, the link's own owner counts.
+        assert_eq!(sorted_find_output("-P", dir, test), both_links, "{test}");
+        assert_eq!(sorted_find_output("-H", dir, test), both_links, "{test}");
+        // With -L, the target's owner counts, except for a dangling link.
+        assert_eq!(sorted_find_output("-L", dir, test), dangling_only, "{test}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn find_links() {
+    ucmd()
+        .args(&["test_data", "-links", "1"])
+        .succeeds()
+        .no_stderr()
+        .stdout_contains("abbbc");
+}
+
+#[cfg(not(unix))]
+#[test]
+fn find_links() {
+    ucmd()
+        .args(&["test_data", "-links", "1"])
+        .fails()
+        .stderr_contains("not available on this platform")
+        .no_stdout();
+}
+
+#[test]
+fn find_mount_xdev() {
+    // Make sure that -mount/-xdev doesn't prune unexpectedly.
+    // TODO: Test with a mount point in the search.
+    ucmd()
+        .args(&["test_data", "-mount"])
+        .succeeds()
+        .no_stderr()
+        .stdout_contains("abbbc");
+
+    ucmd()
+        .args(&["test_data", "-xdev"])
+        .succeeds()
+        .no_stderr()
+        .stdout_contains("abbbc");
+}
+
+#[test]
+fn find_accessible() {
+    ucmd()
+        .args(&["test_data", "-readable"])
+        .succeeds()
+        .no_stderr()
+        .stdout_contains("abbbc");
+
+    ucmd()
+        .args(&["test_data", "-writable"])
+        .succeeds()
+        .no_stderr()
+        .stdout_contains("abbbc");
+
+    #[cfg(unix)]
+    ucmd()
+        .args(&["test_data", "-executable"])
+        .succeeds()
+        .no_stderr()
+        .stdout_does_not_contain("abbbc");
+}
+
+#[test]
+fn find_time() {
+    let args = ["1", "+1", "-1"];
+    let exception_args = ["1%2", "1%2%3", "1a2", "1%2a", "abc", "-", "+", "%"];
+
+    let tests = [
+        "-atime",
+        #[cfg(unix)]
+        "-ctime",
+        "-mtime",
+    ];
+    for flag in &tests {
+        for arg in &args {
+            ucmd()
+                .args(&["./test_data/simple", flag, arg])
+                .succeeds()
+                .no_stderr();
+        }
+
+        for arg in &exception_args {
+            ucmd().args(&[".", flag, arg]).fails().no_stdout();
+        }
+    }
+}
+
+#[test]
+fn expression_empty_parentheses() {
+    ucmd()
+        .args(&["-true", "(", ")"])
+        .fails()
+        .stderr_contains("empty parentheses are not allowed")
+        .no_stdout();
+}
+
+#[test]
+#[cfg(unix)]
+fn find_with_user_predicate() {
+    // Considering the different test environments,
+    // the test code can only use a specific default user to perform the test,
+    // such as the root user on Linux.
+    ucmd()
+        .args(&["test_data", "-user", "root"])
+        .succeeds()
+        .no_stderr();
+
+    ucmd()
+        .args(&["test_data", "-user", ""])
+        .fails()
+        .stderr_contains("empty")
+        .no_stdout();
+
+    ucmd()
+        .args(&["test_data", "-user", " "])
+        .fails()
+        .stderr_contains("invalid user name or UID argument to -user")
+        .no_stdout();
+}
+
+#[test]
+fn find_with_nouser_predicate() {
+    ucmd()
+        .args(&["test_data", "-nouser"])
+        .succeeds()
+        .no_stdout()
+        .no_stderr();
+}
+
+#[test]
+#[cfg(unix)]
+fn find_with_uid_predicate() {
+    use std::os::unix::fs::MetadataExt;
+
+    let uid = Path::new("./test_data")
+        .metadata()
+        .unwrap()
+        .uid()
+        .to_string();
+
+    ucmd()
+        .args(&["test_data", "-uid", &uid])
+        .succeeds()
+        .no_stderr();
+}
+
+#[test]
+fn find_with_group_predicate() {
+    // Considering the different test environments,
+    // the test code can only use a specific default user group for the test,
+    // such as the root user group on Linux.
+    #[cfg(target_os = "linux")]
+    ucmd()
+        .args(&["test_data", "-group", "root"])
+        .succeeds()
+        .no_stderr();
+
+    #[cfg(target_os = "macos")]
+    ucmd()
+        .args(&["test_data", "-group", "staff"])
+        .succeeds()
+        .no_stderr();
+
+    ucmd()
+        .args(&["test_data", "-group", ""])
+        .fails()
+        .stderr_contains("empty")
+        .no_stdout();
+
+    ucmd()
+        .args(&["test_data", "-group", " "])
+        .fails()
+        .stderr_contains("invalid group name or GID argument to -group:")
+        .no_stdout();
+}
+
+#[test]
+fn find_with_nogroup_predicate() {
+    ucmd()
+        .args(&["test_data", "-nogroup"])
+        .succeeds()
+        .no_stdout()
+        .no_stderr();
+}
+
+#[test]
+#[cfg(unix)]
+fn find_with_gid_predicate() {
+    use std::os::unix::fs::MetadataExt;
+
+    let gid = Path::new("./test_data")
+        .metadata()
+        .unwrap()
+        .gid()
+        .to_string();
+
+    ucmd()
+        .args(&["test_data", "-gid", &gid])
+        .succeeds()
+        .no_stderr();
+}
+
+#[test]
+fn find_newer_xy() {
+    let options = [
+        "a",
+        #[cfg(not(target_os = "linux"))]
+        "B",
+        #[cfg(unix)]
+        "c",
+        "m",
+    ];
+
+    for x in options {
+        for y in options {
+            let arg = &format!("-newer{x}{y}");
+            ucmd()
+                .args(&[
+                    "./test_data/simple/subdir",
+                    arg,
+                    "./test_data/simple/subdir/ABBBC",
+                ])
+                .succeeds()
+                .no_stderr();
+        }
+    }
+
+    let args = [
+        "-newerat",
+        #[cfg(not(target_os = "linux"))]
+        "-newerBt",
+        #[cfg(unix)]
+        "-newerct",
+        "-newermt",
+    ];
+    let times = [
+        "jan 01, 2000",
+        "jan 01, 2000 00:00:00",
+        "2000-01-01",
+        "2000-01-01 00:00:00",
+        "2000-01-01T00:00",
+        "1 Jan 2000",
+        "@946684800",
+        "yesterday",
+    ];
+
+    for arg in args {
+        for time in times {
+            ucmd()
+                .args(&["./test_data/simple/subdir", arg, time])
+                .succeeds()
+                .no_stderr();
+        }
+
+        ucmd()
+            .args(&[".", arg, "invalid"])
+            .fails()
+            .stderr_only(format!(
+                "{PROGRAM}: I cannot figure out how to interpret ‘invalid’ as a date or time\n"
+            ));
+    }
+
+    #[cfg(target_os = "linux")]
+    ucmd()
+        .args(&[".", "-newerBt", "jan 01, 2000"])
+        .fails()
+        .stderr_only(format!(
+            "{PROGRAM}: This system does not provide a way to find the birth time of a file.\n"
+        ));
+}
+
+#[test]
+fn find_age_range() {
+    let args = ["-amin", "-cmin", "-mmin"];
+    let times = ["-60", "-120", "-240", "+60", "+120", "+240"];
+    let time_strings = [
+        "\"-60\"", "\"-120\"", "\"-240\"", "\"-60\"", "\"-120\"", "\"-240\"",
+    ];
+
+    for arg in args {
+        for time in times {
+            ucmd().args(&["test_data/simple", arg, time]).succeeds();
+        }
+    }
+
+    for arg in args {
+        for time_string in time_strings {
+            ucmd()
+                .args(&["test_data/simple", arg, time_string])
+                .fails()
+                .stderr_contains(format!(
+                    "{PROGRAM}: Expected a decimal integer (with optional + or - prefix) argument to"
+                ))
+                .no_stdout();
+        }
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn find_fs() {
+    use findutils::find::matchers::fs::get_file_system_type;
+    use std::cell::RefCell;
+
+    let path = Path::new("./test_data/simple/subdir");
+    let empty_cache = RefCell::new(None);
+    let target_fs_type = get_file_system_type(path, &empty_cache).unwrap();
+
+    // match fs type
+    ucmd()
+        .args(&["./test_data/simple/subdir", "-fstype", &target_fs_type])
+        .succeeds()
+        .stdout_contains("./test_data/simple/subdir")
+        .no_stderr();
+
+    // not match fs type
+    ucmd()
+        .args(&[
+            "./test_data/simple/subdir",
+            "-fstype",
+            format!("{} foo", target_fs_type).as_str(),
+        ])
+        .succeeds()
+        .no_output();
+
+    // not contain fstype text.
+    ucmd()
+        .args(&["./test_data/simple/subdir", "-fstype"])
+        .fails()
+        .no_stdout();
+
+    // void fstype
+    ucmd()
+        .args(&["./test_data/simple/subdir", "-fstype", " "])
+        .succeeds()
+        .no_output();
+
+    let path = Path::new("./test_data/links");
+    let empty_cache = RefCell::new(None);
+    let target_fs_type = get_file_system_type(path, &empty_cache).unwrap();
+
+    // working with broken links
+    ucmd()
+        .args(&["./test_data/links", "-fstype", &target_fs_type])
+        .succeeds()
+        .stdout_contains("./test_data/links/link-missing")
+        .no_stderr();
+}
+
+#[test]
+fn find_samefile() {
+    let temp_dir = Builder::new().prefix("find_samefile_").tempdir().unwrap();
+    let temp_dir_path = temp_dir.path().to_str().unwrap();
+    let test_file = temp_dir.path().join("abbbc");
+    let hard_link = temp_dir.path().join("hard_link");
+    fs::copy("test_data/links/abbbc", &test_file).unwrap();
+    fs::hard_link(&test_file, &hard_link).unwrap();
+
+    let test_file_str = test_file.to_str().unwrap();
+    let hard_link_str = hard_link.to_str().unwrap();
+    let not_exist = temp_dir.path().join("not-exist-file");
+    let not_exist_str = not_exist.to_str().unwrap();
+
+    ucmd()
+        .args(&[test_file_str, "-samefile", hard_link_str])
+        .succeeds()
+        .stdout_contains(test_file_str)
+        .no_stderr();
+
+    // test . path
+    ucmd()
+        .args(&[temp_dir_path, "-samefile", temp_dir_path])
+        .succeeds()
+        .stdout_contains(temp_dir_path)
+        .no_stderr();
+
+    ucmd()
+        .args(&[temp_dir_path, "-samefile", test_file_str])
+        .succeeds()
+        .stdout_contains(fix_up_slashes(test_file_str))
+        .no_stderr();
+
+    // test not exist file
+    ucmd()
+        .args(&[temp_dir_path, "-samefile", not_exist_str])
+        .fails()
+        .no_stdout()
+        .stderr_contains("not-exist-file");
+}
+
+#[test]
+fn find_noleaf() {
+    ucmd()
+        .args(&["test_data/simple/subdir", "-noleaf"])
+        .succeeds()
+        .stdout_contains("test_data/simple/subdir")
+        .no_stderr();
+}
+
+#[test]
+fn find_daystart() {
+    ucmd()
+        .args(&["./test_data/simple/subdir", "-daystart", "-mtime", "0"])
+        .succeeds()
+        .no_stderr();
+
+    // twice -daystart should be matched
+    ucmd()
+        .args(&[
+            "./test_data/simple/subdir",
+            "-daystart",
+            "-daystart",
+            "-mtime",
+            "1",
+        ])
+        .succeeds()
+        .no_stderr();
+}
+
+#[test]
+fn find_fprinter() {
+    let temp_dir = Builder::new().prefix("find_fprinter_").tempdir().unwrap();
+    let printer = ["fprint", "fprint0"];
+
+    for p in &printer {
+        let out_file = temp_dir.path().join(format!("find_{p}"));
+        let out_file_str = out_file.to_str().unwrap();
+
+        ucmd()
+            .args(&["test_data/simple", format!("-{p}").as_str(), out_file_str])
+            .succeeds()
+            .no_output();
+
+        // read test_data/find_fprint
+        let mut f = File::open(&out_file).unwrap();
+        let mut contents = String::new();
+        f.read_to_string(&mut contents).unwrap();
+        assert!(contents.contains("test_data/simple"));
+    }
+}
+
+#[test]
+fn find_fprint_dev_stdout_writes_to_standard_output() {
+    // A redirected stdout must not be truncated or overwritten by -fprint,
+    // -fprint0, -fprintf and -fls writing to /dev/stdout.
+    let temp_dir = Builder::new().prefix("find_dev_stdout").tempdir().unwrap();
+    let out_path = temp_dir.path().join("out");
+    fs::write(&out_path, "before\n").unwrap();
+    let out = fs::OpenOptions::new().append(true).open(&out_path).unwrap();
+
+    ucmd()
+        .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("test_data/simple"))
+        .args(&[
+            "abbbc",
+            "-print",
+            "-fprint",
+            "/dev/stdout",
+            "-fprint0",
+            "/dev/stdout",
+            "-fprintf",
+            "/dev/stdout",
+            "%f\n",
+            "-fls",
+            "/dev/stdout",
+        ])
+        .set_stdout(out)
+        .succeeds()
+        .no_stderr();
+
+    let contents = fs::read_to_string(&out_path).unwrap();
+    let ls_line = contents
+        .strip_prefix("before\nabbbc\nabbbc\nabbbc\0abbbc\n")
+        .unwrap_or_else(|| panic!("{contents:?}"));
+    assert_eq!(ls_line.lines().count(), 1, "{contents:?}");
+    assert!(ls_line.ends_with(" abbbc\n"), "{contents:?}");
+}
+
+#[test]
+fn find_fprint_dev_stderr_writes_to_standard_error() {
+    // Error messages and -fprint /dev/stderr output must both end up in a
+    // redirected stderr.
+    let temp_dir = Builder::new().prefix("find_dev_stderr").tempdir().unwrap();
+    let err_path = temp_dir.path().join("err");
+    let err = File::create(&err_path).unwrap();
+
+    ucmd()
+        .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("test_data/simple"))
+        .args(&["abbbc", "does_not_exist", "-fprint", "/dev/stderr"])
+        .set_stderr(err)
+        .fails_with_code(1)
+        .no_stdout();
+
+    let contents = fs::read_to_string(&err_path).unwrap();
+    assert!(contents.starts_with("abbbc\n"), "{contents:?}");
+    assert!(contents.contains("does_not_exist"), "{contents:?}");
+}
+
+#[test]
+fn find_follow() {
+    ucmd()
+        .args(&["test_data/links/link-f", "-follow"])
+        .succeeds()
+        .stdout_contains("test_data/links/link-f")
+        .no_stderr();
+}
+
+// Expected outputs are ordered as [command-line roots, descendants].
+#[rstest::rstest]
+#[case::physical(&["-P"], &[], &[], ["broken-link\ndir-link\nfile-link\n"; 2])]
+#[case::roots(&["-H"], &[], &[], ["broken-link\n", "broken-link\ndir-link\nfile-link\n"])]
+#[case::logical(&["-L"], &[], &[], ["broken-link\n"; 2])]
+#[case::follow(&[], &["-follow"], &[], ["broken-link\n"; 2])]
+#[case::trailing_follow(&[], &[], &["-follow"], ["broken-link\n"; 2])]
+fn find_lname_respects_symlink_following(
+    #[case] options: &[&str],
+    #[case] before_predicate: &[&str],
+    #[case] after_predicate: &[&str],
+    #[case] expected: [&str; 2],
+    #[values(false, true)] descendants: bool,
+    #[values(("-lname", "*target"), ("-ilname", "*TARGET"))] predicate: (&str, &str),
+) {
+    let temp_dir = Builder::new()
+        .prefix("find_lname_")
+        .tempdir()
+        .expect("create temp dir");
+    let root = temp_dir.path();
+    File::create(root.join("file-target")).expect("create target file");
+    fs::create_dir(root.join("dir-target")).expect("create target directory");
+    #[cfg(unix)]
+    {
+        symlink("file-target", root.join("file-link")).expect("create file link");
+        symlink("dir-target", root.join("dir-link")).expect("create directory link");
+        symlink("missing-target", root.join("broken-link")).expect("create broken link");
+    }
+    #[cfg(windows)]
+    {
+        symlink_file("file-target", root.join("file-link")).expect("create file link");
+        symlink_dir("dir-target", root.join("dir-link")).expect("create directory link");
+        symlink_file("missing-target", root.join("broken-link")).expect("create broken link");
+    }
+
+    let mut command = ucmd();
+    command.current_dir(root).env("LC_ALL", "C").args(options);
+    if descendants {
+        command.args(&[".", "-maxdepth", "1", "-sorted"]);
+    } else {
+        command.args(&[
+            "broken-link",
+            "dir-link",
+            "file-link",
+            "dir-target",
+            "file-target",
+            "-maxdepth",
+            "0",
+        ]);
+    }
+    command
+        .args(before_predicate)
+        .args(&[predicate.0, predicate.1])
+        .args(after_predicate)
+        .args(&["-printf", "%f\n"])
+        .succeeds()
+        .no_stderr()
+        .stdout_only(expected[usize::from(descendants)]);
+}
+
+#[test]
+fn find_fprintf() {
+    let temp_dir = Builder::new().prefix("find_fprintf_").tempdir().unwrap();
+    let out_file = temp_dir.path().join("find_fprintf");
+    let out_file_str = out_file.to_str().unwrap();
+
+    ucmd()
+        .args(&["test_data/simple", "-fprintf", out_file_str, "%h %H %p %P"])
+        .succeeds()
+        .no_output();
+
+    // read test_data/find_fprintf
+    let mut f = File::open(&out_file).unwrap();
+    let mut contents = String::new();
+    f.read_to_string(&mut contents).unwrap();
+    assert!(contents.contains("test_data/simple"));
+}
+
+#[test]
+#[cfg(unix)]
+fn find_printf_dirname_keeps_doubled_slash() {
+    // %h is everything before the last slash, so %h/%f gives back %p.
+    ucmd()
+        .args(&[
+            "test_data/simple//",
+            "-sorted",
+            "-mindepth",
+            "1",
+            "-printf",
+            "%h|%f|%p\n",
+        ])
+        .succeeds()
+        .stdout_only(
+            "test_data/simple/|abbbc|test_data/simple//abbbc\n\
+            test_data/simple/|subdir|test_data/simple//subdir\n\
+            test_data/simple//subdir|ABBBC|test_data/simple//subdir/ABBBC\n",
+        );
+
+    ucmd()
+        .args(&["test_data/simple//subdir//ABBBC", "-printf", "%h|%f\n"])
+        .succeeds()
+        .stdout_only("test_data/simple//subdir/|ABBBC\n");
+}
+
+#[test]
+#[cfg(unix)]
+fn find_printf_path_keeps_trailing_slash() {
+    // %p should print a starting point exactly like -print does.
+    ucmd()
+        .args(&[
+            "test_data/simple/",
+            "-maxdepth",
+            "0",
+            "-printf",
+            "%p\n",
+            "-print",
+        ])
+        .succeeds()
+        .stdout_only("test_data/simple/\ntest_data/simple/\n");
+
+    ucmd()
+        .args(&["test_data/simple//", "-name", "abbbc", "-printf", "%p|%P\n"])
+        .succeeds()
+        .stdout_only("test_data/simple//abbbc|abbbc\n");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn find_fprintf_reports_write_error() {
+    let result = ucmd()
+        .args(&[".", "-maxdepth", "0", "-fprintf", "/dev/full", "%p\n"])
+        .fails();
+    result.no_stdout();
+    let stderr = result.stderr_str();
+
+    assert!(stderr.contains("find:"));
+    assert!(stderr.contains("/dev/full"));
+    assert!(stderr.contains("No space left on device"));
+    assert!(!stderr.contains("panicked"));
+}
+
+#[test]
+fn find_fprintf_missing_arguments() {
+    // Regression test: `-fprintf` with no file/format argument must report a
+    // missing-argument error instead of panicking (see issue #696).
+    ucmd()
+        .args(&["-fprintf"])
+        .fails()
+        .stderr_contains("missing argument to `-fprintf'");
+
+    ucmd()
+        .args(&["-fprintf", "/tmp/find_fprintf_out"])
+        .fails()
+        .stderr_contains("missing argument to `-fprintf'");
+}
+
+#[test]
+fn find_ls() {
+    ucmd()
+        .args(&["./test_data/simple/subdir", "-ls"])
+        .succeeds()
+        .no_stderr();
+}
+
+#[test]
+#[cfg(unix)] // TZ only reliably selects the local time zone on unix
+fn find_ls_uses_local_time() {
+    use chrono::{DateTime, FixedOffset};
+
+    let temp_dir = Builder::new().prefix("find_ls_time_").tempdir().unwrap();
+    let file_path = temp_dir.path().join("stamped");
+    File::create(&file_path).expect("create test file");
+    // An hour ago, so the date column shows the time of day.
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        - 3600;
+    filetime::set_file_mtime(&file_path, filetime::FileTime::from_unix_time(secs, 0))
+        .expect("set test file mtime");
+
+    // POSIX TZ "UTC-5" is five hours east of UTC.
+    let expected = DateTime::from_timestamp(secs, 0)
+        .unwrap()
+        .with_timezone(&FixedOffset::east_opt(5 * 3600).unwrap())
+        .format("%b %e %H:%M")
+        .to_string();
+    let result = ucmd()
+        .env("TZ", "UTC-5")
+        .arg(&file_path)
+        .arg("-ls")
+        .succeeds();
+    assert!(
+        result.stdout_str().contains(&expected),
+        "{} does not contain {expected}",
+        result.stdout_str()
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn find_reports_stdout_write_error_once() {
+    for actions in [
+        &[][..],
+        &["-print"],
+        &["-print0"],
+        &["-ls", "-ls"],
+        &["-printf", "%p\n"],
+        &["-printf", "%p\\0"],
+        &["-printf", "%p "],
+        &["-ls", "-printf", "%p\n"],
+        &["-print", "-ls"],
+        &["-print0", "-ls"],
+    ] {
+        let dev_full = fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap();
+        ucmd()
+            .arg("test_data/simple")
+            .args(actions)
+            .set_stdout(dev_full)
+            .fails_with_code(1)
+            .stderr_only("find: 'standard output': No space left on device\n");
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn find_stops_when_stdout_pipe_is_closed() {
+    let temp_dir = Builder::new().prefix("find_closed_pipe").tempdir().unwrap();
+    let printed = temp_dir.path().join("printed");
+    for action in [&["-print"][..], &["-ls"], &["-printf", "%p\n"]] {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        ucmd()
+            .arg("test_data/simple")
+            .args(action)
+            .args(&["-fprint", printed.to_str().unwrap()])
+            .set_stdout(writer)
+            .run()
+            .no_stderr();
+        assert_eq!(fs::read_to_string(&printed).unwrap(), "");
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn find_ls_shows_file_type_and_special_bits() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp_dir = Builder::new().prefix("find_ls_modes").tempdir().unwrap();
+    let file = temp_dir.path().join("setuid");
+    File::create(&file).unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o4755)).unwrap();
+    symlink("setuid", temp_dir.path().join("link")).unwrap();
+    let sticky = temp_dir.path().join("sticky");
+    fs::create_dir(&sticky).unwrap();
+    fs::set_permissions(&sticky, fs::Permissions::from_mode(0o1777)).unwrap();
+
+    ucmd()
+        .args(&[temp_dir.path().to_str().unwrap(), "-ls"])
+        .succeeds()
+        .stdout_contains(" -rwsr-xr-x ")
+        .stdout_contains(" lrwx")
+        .stdout_contains(" drwxrwxrwt ");
+}
+
+#[test]
+#[cfg(unix)]
+fn find_ls_shows_allocated_blocks_and_link_target() {
+    use std::os::unix::fs::MetadataExt;
+
+    let temp_dir = Builder::new().prefix("find_ls_blocks").tempdir().unwrap();
+    let file = temp_dir.path().join("sparse");
+    File::create(&file)
+        .unwrap()
+        .set_len(10 * 1024 * 1024)
+        .unwrap();
+    symlink("sparse", temp_dir.path().join("link")).unwrap();
+
+    // the 1 KiB blocks actually allocated, not the size rounded up
+    let blocks = fs::metadata(&file).unwrap().blocks().div_ceil(2);
+    let result = ucmd().args(&[file.to_str().unwrap(), "-ls"]).succeeds();
+    let fields: Vec<&str> = result.stdout_str().split_whitespace().collect();
+    assert_eq!(fields[1], blocks.to_string());
+
+    ucmd()
+        .args(&[temp_dir.path().join("link").to_str().unwrap(), "-ls"])
+        .succeeds()
+        .stdout_contains(" -> sparse\n");
+}
+
+// Regression test for uutils/findutils#717: `-ls` used to abort (exit 101) when
+// a file's owning uid/gid had no passwd/group entry; it must fall back to the
+// numeric id like GNU find. Creating such a file needs privilege to chown to an
+// unmapped id, so skip when that isn't available (e.g. non-root CI).
+#[test]
+#[cfg(unix)]
+fn find_ls_unmapped_owner_renders_numeric_id() {
+    use nix::unistd::{chown, Gid, Uid};
+
+    let temp_dir = Builder::new().prefix("find_ls_unmapped").tempdir().unwrap();
+    let file = temp_dir.path().join("orphan");
+    File::create(&file).unwrap();
+
+    // A uid/gid essentially never present in /etc/passwd or /etc/group.
+    let unmapped = 4_000_000_000u32;
+    if chown(
+        &file,
+        Some(Uid::from_raw(unmapped)),
+        Some(Gid::from_raw(unmapped)),
+    )
+    .is_err()
+    {
+        return;
+    }
+
+    ucmd()
+        .args(&[file.to_str().unwrap(), "-ls"])
+        .succeeds()
+        .stdout_contains(unmapped.to_string());
+}
+
+#[test]
+#[cfg(unix)]
+fn find_slashes() {
+    ucmd()
+        .args(&["///", "-maxdepth", "0", "-name", "/"])
+        .succeeds()
+        .no_stderr();
+}
+
+// -ok / -okdir integration tests
+//
+// These tests use pipe_in() to supply the user's response.  Because pipe_in()
+// makes stdin a pipe, std::io::stdin().is_terminal() returns false inside the
+// find subprocess, so StandardDependencies::confirm reads from stdin directly
+// instead of opening /dev/tty.  No special environment variable is needed.
+
+#[test]
+fn find_ok_yes_runs_command() {
+    // When the user answers "y", -ok should run the command and print output.
+    ucmd()
+        .args(&[
+            "test_data/simple",
+            "-maxdepth",
+            "1",
+            "-name",
+            "abbbc",
+            "-ok",
+            "echo",
+            "{}",
+            ";",
+        ])
+        // Pipe the affirmative response for the single file found.
+        .pipe_in("y\n")
+        .succeeds()
+        .stderr_contains("< echo") // prompt appeared
+        .stdout_contains("abbbc"); // echo ran
+}
+
+#[test]
+fn find_ok_no_skips_command() {
+    // When the user answers "n", -ok should not run the command.
+    // The expression is false so no output is produced, but find exits 0.
+    ucmd()
+        .args(&[
+            "test_data/simple",
+            "-maxdepth",
+            "1",
+            "-name",
+            "abbbc",
+            "-ok",
+            "echo",
+            "{}",
+            ";",
+        ])
+        .pipe_in("n\n")
+        .succeeds()
+        .stderr_contains("< echo") // prompt still appeared
+        .no_stdout(); // but echo was not run
+}
+
+#[test]
+fn find_ok_prompt_format() {
+    // The prompt should follow GNU find's "< executable args... >? " format.
+    ucmd()
+        .args(&[
+            "test_data/simple",
+            "-maxdepth",
+            "1",
+            "-name",
+            "abbbc",
+            "-ok",
+            "echo",
+            "{}",
+            ";",
+        ])
+        .pipe_in("n\n")
+        .succeeds()
+        .stderr_contains(format!(
+            "< echo ... {} > ? ",
+            Path::new("test_data/simple")
+                .join("abbbc")
+                .to_string_lossy()
+        ));
+}
+
+#[test]
+fn find_ok_empty_response_declines() {
+    // An empty line (just Enter) should be treated as decline.
+    ucmd()
+        .args(&[
+            "test_data/simple",
+            "-maxdepth",
+            "1",
+            "-name",
+            "abbbc",
+            "-ok",
+            "echo",
+            "{}",
+            ";",
+        ])
+        .pipe_in("\n")
+        .succeeds()
+        .no_stdout();
+}
+
+#[test]
+fn find_ok_accepts_y_variants() {
+    // "Y", "yes", and " y" (leading whitespace) should all be accepted.
+    for response in &["Y\n", "yes\n", " y\n"] {
+        ucmd()
+            .args(&[
+                "test_data/simple",
+                "-maxdepth",
+                "1",
+                "-name",
+                "abbbc",
+                "-ok",
+                "echo",
+                "{}",
+                ";",
+            ])
+            .pipe_in(*response)
+            .succeeds()
+            .stdout_contains("abbbc");
+    }
+}
+
+#[test]
+fn find_okdir_yes_runs_command() {
+    // -okdir should run the command in the file's parent directory.
+    ucmd()
+        .args(&[
+            "test_data/simple",
+            "-maxdepth",
+            "1",
+            "-name",
+            "abbbc",
+            "-okdir",
+            "echo",
+            "{}",
+            ";",
+        ])
+        .pipe_in("y\n")
+        .succeeds()
+        .stderr_contains("< echo")
+        .stdout_contains(fix_up_slashes("./abbbc"));
+}
+
+#[test]
+fn find_ok_missing_semicolon() {
+    // -ok without a closing ';' should be an error (just like -exec).
+    ucmd()
+        .args(&["test_data/simple", "-ok", "echo", "{}"])
+        .pipe_in("")
+        .fails()
+        .stderr_contains("missing argument to `-ok'")
+        .no_stdout();
+}
+
+#[test]
+fn version_write_error_is_handled() {
+    use std::cell::RefCell;
+
+    struct BrokenWriter;
+    impl std::io::Write for BrokenWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from_raw_os_error(28))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::from_raw_os_error(28))
+        }
+    }
+
+    struct BrokenDependencies {
+        output: RefCell<BrokenWriter>,
+    }
+
+    impl BrokenDependencies {
+        fn new() -> Self {
+            Self {
+                output: RefCell::new(BrokenWriter),
+            }
+        }
+    }
+
+    impl findutils::find::Dependencies for BrokenDependencies {
+        fn get_output(&self) -> &RefCell<dyn Write> {
+            &self.output
+        }
+
+        fn now(&self) -> time::SystemTime {
+            time::SystemTime::now()
+        }
+
+        fn confirm(&self, _prompt: &str) -> bool {
+            false
+        }
+    }
+
+    let deps = BrokenDependencies::new();
+    let rc = findutils::find::find_main(&["find", "--version"], &deps);
+    assert_eq!(rc, 1);
+}
+
+#[test]
+fn print_write_error_is_reported_not_swallowed() {
+    // Regression test: a write/flush failure other than a broken pipe
+    // (e.g. a full disk) must be reported with a nonzero exit code,
+    // not silently ignored or turned into a panic.
+    use std::cell::RefCell;
+
+    struct BrokenWriter;
+    impl std::io::Write for BrokenWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from_raw_os_error(28)) // ENOSPC
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::from_raw_os_error(28))
+        }
+    }
+
+    struct BrokenDependencies {
+        output: RefCell<BrokenWriter>,
+    }
+
+    impl BrokenDependencies {
+        fn new() -> Self {
+            Self {
+                output: RefCell::new(BrokenWriter),
+            }
+        }
+    }
+
+    impl findutils::find::Dependencies for BrokenDependencies {
+        fn get_output(&self) -> &RefCell<dyn Write> {
+            &self.output
+        }
+
+        fn now(&self) -> time::SystemTime {
+            time::SystemTime::now()
+        }
+
+        fn confirm(&self, _prompt: &str) -> bool {
+            false
+        }
+    }
+
+    let deps = BrokenDependencies::new();
+    let rc = findutils::find::find_main(&["find", "test_data/simple", "-maxdepth", "0"], &deps);
+    assert_eq!(rc, 1);
+}
+
+#[test]
+fn find_exits_cleanly_on_broken_pipe() {
+    // Regression test: `find | head` must exit cleanly instead of
+    // panicking when the reader closes its end of the pipe early. (See issue#801)
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_find"))
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .arg(".")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Drop the read end without reading, so `find`'s writes fail with
+    // EPIPE once it produces more output than the pipe buffer holds.
+    drop(child.stdout.take());
+
+    let status = child.wait().unwrap();
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+
+    assert!(
+        status.success(),
+        "find should exit cleanly on a broken pipe instead of panicking, \
+         got status {status:?}, stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "find panicked instead of exiting cleanly on a broken pipe:\n{stderr}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn missing_starting_point_is_named_without_os_error() {
+    ucmd()
+        .args(&["./test_data/simple/abbbc", "xyz.nonexistentDir"])
+        .fails()
+        .stdout_is("./test_data/simple/abbbc\n")
+        .stderr_is("find: 'xyz.nonexistentDir': No such file or directory\n");
+}
